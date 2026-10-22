@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   STORAGE_KEY, RECOVERY_KEY, addExpense, addGoal, closeMonth, contributeToGoal,
   currentMonth, deleteExpense, emptyState, initialState, monthSummary,
-  readState, setBudgets, writeState,
+  readState, setBudgets, writeState, applyDueMonths, defaultPlan, depositSavings,
+  getMonthlyPlan, savingsSummary, setMonthlyPlan, withdrawSavings,
 } from './model';
 import type { State } from './model';
 
@@ -12,7 +13,7 @@ const fixture = (): State => {
 };
 const expense = (amount = 750000) => ({ title: 'Monthly spending', categoryId: 'food', amount, date: `${currentMonth()}-01`, note: '' });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('monthly spending and reward accounting', () => {
   it('moves exactly the unspent ₹500 from an ₹8,000 budget to rewards', () => {
@@ -83,7 +84,7 @@ describe('monthly spending and reward accounting', () => {
 
 describe('separate savings and rewards goals', () => {
   it('does not spend monthly budget or rewards when contributing to savings', () => {
-    const state = addGoal(fixture(), { name: 'Emergency fund', target: 1000000, emoji: '☂️', kind: 'savings' });
+    const state = addGoal(depositSavings(fixture(), 200000), { name: 'Emergency fund', target: 1000000, emoji: '☂️', kind: 'savings' });
     const next = contributeToGoal(state, state.goals[0].id, 200000);
     expect(next.goals[0].saved).toBe(200000);
     expect(next.rewardPool).toBe(0);
@@ -109,7 +110,7 @@ describe('separate savings and rewards goals', () => {
 describe('demo data and browser persistence', () => {
   it('has a usable explicitly demo starting point and an empty alternative', () => {
     const summary = monthSummary(initialState(), currentMonth());
-    expect(summary).toMatchObject({ budget: 800000, spent: 563900 });
+    expect(summary).toMatchObject({ budget: 350000, spent: 239900 });
     expect(monthSummary(emptyState(), currentMonth())).toMatchObject({ budget: 0, spent: 0 });
     expect(emptyState()).toMatchObject({ expenses: [], goals: [], rewardPool: 0, rewardHistory: [] });
   });
@@ -137,7 +138,7 @@ describe('demo data and browser persistence', () => {
     const damaged = '{this-used-to-be-user-data';
     const data = new Map<string, string>([[STORAGE_KEY, damaged]]);
     vi.stubGlobal('localStorage', { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value) });
-    expect(readState().version).toBe(1);
+    expect(readState().version).toBe(2);
     expect(data.get(STORAGE_KEY)).toBe(damaged);
     const state = fixture();
     writeState(state);
@@ -163,11 +164,199 @@ describe('demo data and browser persistence', () => {
 
   it('recovers from corrupt or unavailable browser storage', () => {
     vi.stubGlobal('localStorage', { getItem: () => '{bad-json' });
-    expect(readState().version).toBe(1);
+    expect(readState().version).toBe(2);
     vi.stubGlobal('localStorage', { getItem: () => JSON.stringify({ version: 1, rewardPool: -100 }) });
     expect(readState().categories).toHaveLength(6);
     vi.stubGlobal('localStorage', undefined);
     expect(() => readState()).not.toThrow();
     expect(() => writeState(fixture())).toThrow(/storage is unavailable/);
+  });
+});
+
+describe('salary plans and automatic monthly savings', () => {
+  const at = (date: string) => { vi.useFakeTimers(); vi.setSystemTime(new Date(`${date}T12:00:00Z`)); };
+
+  it('sets aside fixed costs and savings before calculating the spending allowance', () => {
+    const state = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    expect(monthSummary(state, currentMonth())).toMatchObject({ salary: 1250000, fixedCosts: 700000, savings: 200000, budget: 350000, remaining: 350000 });
+    expect(savingsSummary(state)).toMatchObject({ balance: 200000, available: 200000, allocated: 0 });
+    expect(state.savingsTransactions.filter(entry => entry.kind === 'monthly')).toHaveLength(1);
+    expect(applyDueMonths(state)).toBe(state);
+    expect(savingsSummary(setMonthlyPlan(state, currentMonth(), defaultPlan())).balance).toBe(200000);
+  });
+
+  it('treats categories as guides while judging rewards against the total allowance', () => {
+    let state = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    state = setBudgets(state, currentMonth(), { food: 100000, groceries: 200000 });
+    state = addExpense(state, { ...expense(150000), categoryId: 'food' });
+    state = addExpense(state, { ...expense(100000), categoryId: 'groceries' });
+    expect(monthSummary(state, currentMonth())).toMatchObject({ budget: 350000, categoryBudgetTotal: 300000, spent: 250000, remaining: 100000 });
+    expect(state.months[currentMonth()].plan).toEqual(defaultPlan());
+    expect(state.months[currentMonth()].savingsApplied).toBe(true);
+    const closed = closeMonth(state, currentMonth());
+    expect(closed.rewardPool).toBe(100000);
+    expect(savingsSummary(closed).balance).toBe(200000);
+  });
+
+  it('catches up each missed month exactly once without crediting future months', () => {
+    at('2026-10-22');
+    const state = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    at('2027-01-03');
+    const next = applyDueMonths(state);
+    expect(savingsSummary(next).balance).toBe(800000);
+    expect(next.savingsTransactions.filter(entry => entry.kind === 'monthly').map(entry => entry.month)).toEqual(['2026-10', '2026-11', '2026-12', '2027-01']);
+    expect(applyDueMonths(next)).toBe(next);
+    expect(applyDueMonths(next, '9999-01')).toBe(next);
+    expect(getMonthlyPlan(next, '2027-01')).toEqual(defaultPlan());
+  });
+
+  it('respects a scheduled future plan without applying its amount early', () => {
+    at('2026-10-22');
+    const oldPlan = defaultPlan(); const newPlan = { ...oldPlan, savings: 300000 };
+    const state = setMonthlyPlan(setMonthlyPlan(emptyState(), '2026-10', oldPlan), '2026-12', newPlan);
+    expect(savingsSummary(state).balance).toBe(200000);
+    expect(getMonthlyPlan(state, '2026-11')?.savings).toBe(200000);
+    expect(getMonthlyPlan(state, '2026-12')?.savings).toBe(300000);
+    at('2026-11-02');
+    const november = applyDueMonths(state);
+    expect(savingsSummary(november).balance).toBe(400000);
+    expect(monthSummary(november, '2026-11').budget).toBe(350000);
+    at('2026-12-02');
+    const december = applyDueMonths(november);
+    expect(savingsSummary(december).balance).toBe(700000);
+    expect(monthSummary(december, '2026-12').budget).toBe(250000);
+    expect(monthSummary(december, '2026-10').budget).toBe(350000);
+  });
+
+  it('keeps explicit future changes when editing an intervening plan', () => {
+    at('2026-10-22');
+    let state = setMonthlyPlan(emptyState(), '2026-10', defaultPlan());
+    state = setMonthlyPlan(state, '2027-01', { ...defaultPlan(), savings: 400000 });
+    state = setMonthlyPlan(state, '2026-12', { ...defaultPlan(), savings: 300000 });
+    expect(getMonthlyPlan(state, '2026-11')?.savings).toBe(200000);
+    expect(getMonthlyPlan(state, '2026-12')?.savings).toBe(300000);
+    expect(getMonthlyPlan(state, '2027-01')?.savings).toBe(400000);
+    at('2027-02-02');
+    expect(savingsSummary(applyDueMonths(state)).balance).toBe(1500000);
+  });
+
+  it('reconciles current-month edits rather than duplicating their credit', () => {
+    let state = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    state = setMonthlyPlan(state, currentMonth(), { ...defaultPlan(), savings: 250000 });
+    expect(savingsSummary(state).balance).toBe(250000);
+    expect(state.savingsTransactions.filter(entry => entry.kind === 'monthly')).toHaveLength(1);
+    expect(monthSummary(state, currentMonth()).budget).toBe(300000);
+    state = setMonthlyPlan(state, currentMonth(), { ...defaultPlan(), savings: 0 });
+    expect(savingsSummary(state).balance).toBe(0);
+    expect(state.months[currentMonth()].savingsApplied).toBe(true);
+    expect(applyDueMonths(state)).toBe(state);
+  });
+
+  it('rejects impossible plans, closed/past edits, and reductions of used savings', () => {
+    expect(() => setMonthlyPlan(emptyState(), currentMonth(), { ...defaultPlan(), salary: 800000 })).toThrow(/exceed/);
+    expect(() => setMonthlyPlan(emptyState(), currentMonth(), { ...defaultPlan(), savings: -1 })).toThrow();
+    expect(() => setMonthlyPlan(emptyState(), '2000-01', defaultPlan())).toThrow(/past/i);
+    const state = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    const used = withdrawSavings(state, 150000);
+    expect(() => setMonthlyPlan(used, currentMonth(), { ...defaultPlan(), savings: 100000 })).toThrow(/used or allocated/);
+    const closed = closeMonth(state, currentMonth());
+    expect(() => setMonthlyPlan(closed, currentMonth(), defaultPlan())).toThrow(/closed/);
+  });
+
+  it('starts future-only plans on their effective month', () => {
+    at('2026-10-22');
+    const state = setMonthlyPlan(emptyState(), '2026-12', defaultPlan());
+    expect(getMonthlyPlan(state, '2026-10')).toBeNull();
+    expect(savingsSummary(state).balance).toBe(0);
+    at('2026-11-30'); expect(applyDueMonths(state)).toBe(state);
+    at('2026-12-01'); expect(savingsSummary(applyDueMonths(state)).balance).toBe(200000);
+  });
+});
+
+describe('savings account deposits, withdrawals, and allocations', () => {
+  it('records windfalls and withdrawals without changing spending or rewards', () => {
+    const base = setMonthlyPlan(emptyState(), currentMonth(), defaultPlan());
+    const deposited = depositSavings(base, 75000, 'Birthday gift');
+    const next = withdrawSavings(deposited, 25000, 'Unexpected repair');
+    expect(savingsSummary(next)).toMatchObject({ balance: 250000, available: 250000, allocated: 0, deposited: 275000, withdrawn: 25000 });
+    expect(monthSummary(next, currentMonth())).toEqual(monthSummary(base, currentMonth()));
+    expect(next.rewardPool).toBe(base.rewardPool);
+    expect(next.savingsTransactions.at(-1)).toMatchObject({ kind: 'withdrawal', amount: 25000, note: 'Unexpected repair' });
+  });
+
+  it('allocates existing savings and can withdraw money from a funded goal', () => {
+    let state = addGoal(depositSavings(emptyState(), 100000), { name: 'Rainy day', target: 200000, emoji: '☂️', kind: 'savings' });
+    state = contributeToGoal(state, state.goals[0].id, 80000);
+    expect(savingsSummary(state)).toMatchObject({ balance: 100000, allocated: 80000, available: 20000 });
+    expect(() => withdrawSavings(state, 30000)).toThrow(/unallocated/);
+    state = withdrawSavings(state, 50000, 'Rainy day arrived', state.goals[0].id);
+    expect(savingsSummary(state)).toMatchObject({ balance: 50000, allocated: 30000, available: 20000 });
+    expect(state.goals[0].saved).toBe(30000);
+    expect(() => withdrawSavings(state, 30001, '', state.goals[0].id)).toThrow(/enough saved/);
+  });
+
+  it('can deposit directly into a goal without double-counting funds', () => {
+    const state = addGoal(emptyState(), { name: 'Emergency fund', target: 100000, emoji: '☂️', kind: 'savings' });
+    const next = depositSavings(state, 60000, 'Windfall', state.goals[0].id);
+    expect(savingsSummary(next)).toMatchObject({ balance: 60000, allocated: 60000, available: 0 });
+    expect(next.goals[0].saved).toBe(60000);
+    expect(() => depositSavings(next, 50000, '', next.goals[0].id)).toThrow(/more than/);
+    expect(() => contributeToGoal(next, next.goals[0].id, 1)).toThrow(/unallocated/);
+    expect(() => withdrawSavings(next, 1)).toThrow(/unallocated/);
+  });
+
+  it('rejects negative, fractional, missing-goal, and unavailable money', () => {
+    const state = emptyState();
+    for (const amount of [-1, 0, 1.5, NaN, Infinity]) {
+      expect(() => depositSavings(state, amount)).toThrow();
+      expect(() => withdrawSavings(state, amount)).toThrow();
+    }
+    expect(() => withdrawSavings(state, 1)).toThrow();
+    expect(() => depositSavings(state, 1, '', 'missing')).toThrow(/valid savings goal/);
+  });
+});
+
+describe('upgrade and automatic savings persistence', () => {
+  const storage = (initial?: string) => {
+    const data = new Map<string, string>(initial ? [[STORAGE_KEY, initial]] : []);
+    vi.stubGlobal('localStorage', { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value) });
+    return data;
+  };
+
+  it('preserves all v1 records and goal balances without imposing a salary plan', () => {
+    const base = closeMonth(addExpense(fixture(), expense()), currentMonth());
+    const legacy = { ...base, version: 1, goals: [{ id: 'old-goal', name: 'Existing savings', target: 500000, saved: 123456, emoji: '☂️', kind: 'savings' }] } as Record<string, unknown>;
+    delete legacy.recurringPlan; delete legacy.planStartMonth; delete legacy.savingsTransactions;
+    const raw = JSON.stringify(legacy); const data = storage(raw);
+    const migrated = readState();
+    expect(migrated.version).toBe(2);
+    expect(migrated.goals).toEqual(legacy.goals);
+    expect(migrated.expenses).toEqual(legacy.expenses);
+    expect(migrated.months).toEqual(legacy.months);
+    expect(migrated.rewardHistory).toEqual(legacy.rewardHistory);
+    expect(migrated.rewardPool).toBe(50000);
+    expect(migrated.recurringPlan).toBeNull();
+    expect(savingsSummary(migrated)).toMatchObject({ balance: 123456, allocated: 123456, available: 0 });
+    expect(data.get(`${STORAGE_KEY}-v1-backup`)).toBe(raw);
+    expect(JSON.parse(data.get(STORAGE_KEY)!).version).toBe(2);
+    expect(readState()).toEqual(migrated);
+  });
+
+  it('persists the first monthly credit even before the first user edit', () => {
+    const data = storage();
+    const first = readState();
+    expect(data.has(STORAGE_KEY)).toBe(true);
+    expect(readState()).toEqual(first);
+    expect(first.savingsTransactions.filter(entry => entry.kind === 'monthly')).toHaveLength(1);
+  });
+
+  it('persists overdue credits so repeated reads and reloads cannot duplicate them', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-22T12:00:00Z'));
+    storage(); writeState(setMonthlyPlan(emptyState(), '2026-10', defaultPlan()));
+    vi.setSystemTime(new Date('2026-12-10T12:00:00Z'));
+    const first = readState(); const second = readState();
+    expect(first).toEqual(second);
+    expect(savingsSummary(second).balance).toBe(600000);
+    expect(second.savingsTransactions.filter(entry => entry.kind === 'monthly')).toHaveLength(3);
   });
 });
