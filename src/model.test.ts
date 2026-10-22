@@ -3,7 +3,7 @@ import {
   STORAGE_KEY, RECOVERY_KEY, addExpense, addGoal, closeMonth, contributeToGoal,
   currentMonth, deleteExpense, emptyState, initialState, monthSummary,
   readState, setBudgets, writeState, applyDueMonths, defaultPlan, depositSavings,
-  getMonthlyPlan, savingsSummary, setMonthlyPlan, withdrawSavings,
+  getMonthlyPlan, savingsSummary, setMonthlyPlan, withdrawSavings, categoryBudgets, useDefaultBudgets,
 } from './model';
 import type { State } from './model';
 
@@ -358,5 +358,114 @@ describe('upgrade and automatic savings persistence', () => {
     expect(first).toEqual(second);
     expect(savingsSummary(second).balance).toBe(600000);
     expect(second.savingsTransactions.filter(entry => entry.kind === 'monthly')).toHaveLength(3);
+  });
+});
+
+
+describe('optional expense descriptions and recurring category budgets', () => {
+  const at = (date: string) => { vi.useFakeTimers(); vi.setSystemTime(new Date(`${date}T12:00:00Z`)); };
+
+  it('uses the category name when an expense description is empty or whitespace', () => {
+    const state = fixture();
+    for (const title of ['', '   ']) {
+      const next = addExpense(state, { ...expense(12345), title, categoryId: 'groceries' });
+      expect(next.expenses[0]).toMatchObject({ title: 'Groceries', amount: 12345, categoryId: 'groceries' });
+      expect(monthSummary(next, currentMonth()).spent).toBe(12345);
+    }
+    expect(addExpense(state, { ...expense(1), title: '  A named expense  ' }).expenses[0].title).toBe('A named expense');
+    expect(() => addExpense(state, { ...expense(0), title: '' })).toThrow();
+    expect(() => addExpense(state, { ...expense(1), title: '', categoryId: 'missing' })).toThrow(/category/);
+  });
+
+  it('reuses all-month budgets for new months and already-created inherited months', () => {
+    at('2026-10-22');
+    let state = setMonthlyPlan(emptyState(), '2026-10', defaultPlan());
+    state = setMonthlyPlan(state, '2026-12', defaultPlan());
+    const plan = state.months['2026-12'].plan;
+    state = setBudgets(state, '2026-10', { food: 100000, groceries: 150000 }, 'all');
+    expect(categoryBudgets(state, '2026-10')).toMatchObject({ food: 100000, groceries: 150000 });
+    expect(categoryBudgets(state, '2026-11')).toMatchObject({ food: 100000, groceries: 150000 });
+    expect(categoryBudgets(state, '2026-12')).toMatchObject({ food: 100000, groceries: 150000 });
+    expect(state.months['2026-12'].plan).toEqual(plan);
+    expect(state.months['2026-10'].savingsApplied).toBe(true);
+    at('2027-01-02');
+    const caughtUp = applyDueMonths(state);
+    expect(caughtUp.months['2027-01'].budgetOverride).toBe(false);
+    expect(categoryBudgets(caughtUp, '2027-01')).toMatchObject({ food: 100000, groceries: 150000 });
+    expect(savingsSummary(caughtUp).balance).toBe(800000);
+    expect(monthSummary(caughtUp, '2027-01').budget).toBe(350000);
+  });
+
+  it('starts a new inherited month when recording an expense without a salary plan', () => {
+    at('2026-10-22');
+    let state = setBudgets(emptyState(), '2026-10', { food: 100000 }, 'all');
+    const october = state.months['2026-10'];
+    at('2026-11-02');
+    state = addExpense(state, { ...expense(25000), title: '', date: '2026-11-01' });
+    expect(state.months['2026-10']).toBe(october);
+    expect(state.months['2026-11']).toMatchObject({ budgets: { food: 100000 }, closed: false, rewardTransfer: 0, budgetOverride: false });
+    expect(state.expenses[0].title).toBe('Food & coffee');
+    state = setBudgets(state, '2026-10', { food: 150000 }, 'all');
+    expect(categoryBudgets(state, '2026-11').food).toBe(150000);
+    state = closeMonth(state, '2026-11');
+    expect(monthSummary(state, '2026-11')).toMatchObject({ closed: true, budget: 150000, spent: 25000, transfer: 125000 });
+    state = setBudgets(state, '2026-12', { food: 200000 }, 'all');
+    expect(categoryBudgets(state, '2026-11').food).toBe(150000);
+    expect(state.rewardPool).toBe(125000);
+    expect(state.recurringPlan).toBeNull();
+  });
+
+  it('keeps a specific-month override when recurring amounts change again', () => {
+    let state = setBudgets(emptyState(), currentMonth(), { food: 100000 }, 'all');
+    state = setBudgets(state, '2027-01', { food: 175000 }, 'month');
+    state = setBudgets(state, currentMonth(), { food: 120000 }, 'all');
+    expect(categoryBudgets(state, currentMonth()).food).toBe(120000);
+    expect(categoryBudgets(state, '2027-01').food).toBe(175000);
+    expect(categoryBudgets(state, '2027-02').food).toBe(120000);
+    expect(state.months['2027-01'].budgetOverride).toBe(true);
+    const restored = useDefaultBudgets(state, '2027-01');
+    expect(categoryBudgets(restored, '2027-01').food).toBe(120000);
+    expect(restored.months['2027-01'].budgetOverride).toBe(false);
+    expect(state.months['2027-01'].budgets.food).toBe(175000);
+  });
+
+  it('freezes closed inherited budgets and reward transfers when defaults change', () => {
+    at('2026-10-22');
+    let state = setBudgets(emptyState(), '2026-10', { food: 100000 }, 'all');
+    state = closeMonth(addExpense(state, { ...expense(75000), date: '2026-10-01' }), '2026-10');
+    const closed = state.months['2026-10'];
+    state = { ...state, categories: [...state.categories, { id: 'books', name: 'Books', color: '#123456', icon: 'tag', budget: 10000 }] };
+    state = setBudgets(state, '2026-11', { food: 200000, books: 30000 }, 'all');
+    expect(state.months['2026-10']).toBe(closed);
+    expect(categoryBudgets(state, '2026-10')).toMatchObject({ food: 100000, books: 0 });
+    expect(monthSummary(state, '2026-10')).toMatchObject({ budget: 100000, spent: 75000, transfer: 25000 });
+    expect(state.rewardPool).toBe(25000);
+    expect(() => setBudgets(state, '2026-10', { food: 1 }, 'all')).toThrow(/closed/);
+    expect(() => useDefaultBudgets(state, '2026-10')).toThrow(/closed/);
+  });
+
+  it('preserves unmarked existing v2 month snapshots and round-trips new defaults', () => {
+    let legacy = setBudgets(emptyState(), currentMonth(), { food: 80000 });
+    delete legacy.months[currentMonth()].budgetOverride;
+    const raw = JSON.stringify(legacy);
+    const data = new Map<string, string>([[STORAGE_KEY, raw]]);
+    vi.stubGlobal('localStorage', { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value) });
+    expect(readState()).toEqual(legacy);
+    const updated = setBudgets(readState(), '2027-01', { food: 123000 }, 'all');
+    expect(categoryBudgets(updated, currentMonth()).food).toBe(80000);
+    expect(categoryBudgets(updated, '2027-01').food).toBe(123000);
+    writeState(updated);
+    expect(readState()).toEqual(updated);
+    expect(data.get(RECOVERY_KEY)).toBeUndefined();
+  });
+
+  it('rejects invalid scopes, negative recurring amounts, and invalid override metadata', () => {
+    const state = emptyState();
+    expect(() => setBudgets(state, currentMonth(), { food: 100 }, 'unsupported' as never)).toThrow(/all months/);
+    expect(() => setBudgets(state, currentMonth(), { food: -1 }, 'all')).toThrow();
+    expect(() => setBudgets(state, currentMonth(), { missing: 100 }, 'all')).toThrow(/category/);
+    const broken = { ...state, months: { [currentMonth()]: { ...state.months[currentMonth()], budgetOverride: 'invalid' as never } } };
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined });
+    expect(() => writeState(broken)).toThrow(/invalid/);
   });
 });

@@ -17,11 +17,23 @@ async function setUpSalaryPlan(page: Page) {
 async function addExpense(page: Page, title: string, amount: string, category = 'food') {
   await page.getByRole('button', { name: 'Add expense', exact: true }).click();
   const dialog = page.getByRole('dialog');
-  await dialog.getByRole('textbox', { name: 'What was it for?', exact: true }).fill(title);
+  await dialog.getByRole('textbox', { name: /^What was it for/ }).fill(title);
   await dialog.getByRole('spinbutton', { name: 'Amount (INR)', exact: true }).fill(amount);
   await dialog.getByRole('combobox', { name: 'Category', exact: true }).selectOption(category);
   await dialog.getByRole('button', { name: 'Save expense', exact: true }).click();
   await expect(dialog).toHaveCount(0);
+}
+
+function followingMonth(month: string, offset: number) {
+  const date = new Date(`${month}-01T12:00:00`);
+  date.setMonth(date.getMonth() + offset);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+async function expectCategoryBudget(page: Page, category: string, amount: string) {
+  await page.getByRole('button', { name: 'Edit budgets', exact: true }).click();
+  await expect(page.getByRole('spinbutton', { name: `${category} budget`, exact: true })).toHaveValue(amount);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
 }
 
 async function createSavingsGoal(page: Page, name: string, target = '10000') {
@@ -186,7 +198,7 @@ test('expenses can be edited, searched, exported, deleted, and categorized', asy
   await expect(page.locator('.expense-table tbody tr')).toHaveCount(1);
   await expect(page.locator('.expense-table tbody')).toContainText('₹299.5');
   await page.getByRole('button', { name: 'Edit Bookshop purchase', exact: true }).click();
-  await page.getByRole('textbox', { name: 'What was it for?', exact: true }).fill('Learning books');
+  await page.getByRole('textbox', { name: /^What was it for/ }).fill('Learning books');
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await page.getByRole('textbox', { name: 'Search transactions', exact: true }).fill('Learning books');
   await expect(page.locator('.expense-table tbody tr')).toHaveCount(1);
@@ -205,6 +217,85 @@ test('expenses can be edited, searched, exported, deleted, and categorized', asy
   await expect(page.locator('.balance-card .stat-value')).toHaveText('₹3,500');
   await page.getByRole('button', { name: 'Monthly budgets', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Books & learning', exact: true })).toBeVisible();
+});
+
+test('expense descriptions are optional and unnamed expenses keep a useful category label', async ({ page }) => {
+  await startFresh(page);
+  await setUpSalaryPlan(page);
+  await page.getByRole('button', { name: 'Add expense', exact: true }).click();
+  const description = page.getByRole('textbox', { name: /^What was it for/ });
+  await expect(description).not.toHaveAttribute('required');
+  await page.getByRole('spinbutton', { name: 'Amount (INR)', exact: true }).fill('40');
+  await page.getByRole('button', { name: 'Save expense', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await addExpense(page, '   ', '60.25', 'groceries');
+
+  await page.getByRole('button', { name: 'Transactions', exact: true }).click();
+  await expect(page.locator('.expense-table tbody tr')).toHaveCount(2);
+  await expect(page.getByRole('button', { name: 'Edit Food & coffee', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit Groceries', exact: true })).toBeVisible();
+  await expect(page.locator('.expense-table tbody')).toContainText('₹60.25');
+
+  await page.reload();
+  await expect(page.locator('.balance-card .stat-value')).toHaveText('₹3,399.75');
+  await page.getByRole('button', { name: 'Transactions', exact: true }).click();
+  await expect(page.locator('.expense-table tbody tr')).toHaveCount(2);
+  await expect(page.getByRole('button', { name: 'Edit Food & coffee', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit Groceries', exact: true })).toBeVisible();
+});
+
+test('recurring category budgets apply across months while specific month changes stay independent', async ({ page }) => {
+  await startFresh(page);
+  await setUpSalaryPlan(page);
+  const current = await page.getByLabel('Selected month', { exact: true }).inputValue();
+  const next = followingMonth(current, 1);
+  const later = followingMonth(current, 2);
+  // HTML month inputs have no consistent implicit role across browsers.
+  const selectMonth = async (month: string) => page.getByLabel('Selected month', { exact: true }).fill(month);
+
+  await page.getByRole('button', { name: 'Edit budgets', exact: true }).click();
+  await expect(page.getByRole('radio', { name: 'All months', exact: true })).toBeChecked();
+  await page.getByRole('spinbutton', { name: 'Food & coffee budget', exact: true }).fill('1000');
+  await page.getByRole('spinbutton', { name: 'Groceries budget', exact: true }).fill('1500');
+  await page.getByRole('button', { name: 'Save budgets', exact: true }).click();
+
+  await selectMonth(next);
+  await page.getByRole('button', { name: 'Edit budgets', exact: true }).click();
+  await expect(page.getByRole('spinbutton', { name: 'Food & coffee budget', exact: true })).toHaveValue('1000');
+  await expect(page.getByRole('spinbutton', { name: 'Groceries budget', exact: true })).toHaveValue('1500');
+  await page.getByRole('radio', { name: 'Only this month', exact: true }).check();
+  await page.getByRole('spinbutton', { name: 'Food & coffee budget', exact: true }).fill('500');
+  await page.getByRole('button', { name: 'Save budgets', exact: true }).click();
+
+  await selectMonth(later);
+  await expectCategoryBudget(page, 'Food & coffee', '1000');
+  await selectMonth(current);
+  await page.getByRole('button', { name: 'Edit budgets', exact: true }).click();
+  await page.getByRole('radio', { name: 'All months', exact: true }).check();
+  await page.getByRole('spinbutton', { name: 'Food & coffee budget', exact: true }).fill('1200');
+  await page.getByRole('button', { name: 'Save budgets', exact: true }).click();
+  await expect(page.locator('.balance-card .stat-value')).toHaveText('₹3,500');
+  await selectMonth(next);
+  await expectCategoryBudget(page, 'Food & coffee', '500');
+  await selectMonth(later);
+  await expectCategoryBudget(page, 'Food & coffee', '1200');
+
+  await page.reload();
+  await selectMonth(next);
+  await expectCategoryBudget(page, 'Food & coffee', '500');
+  await selectMonth(later);
+  await expectCategoryBudget(page, 'Food & coffee', '1200');
+  await selectMonth(next);
+  await page.getByRole('button', { name: 'Monthly budgets', exact: true }).click();
+  await page.getByRole('button', { name: 'Use recurring budgets', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Use recurring budgets', exact: true })).toHaveCount(0);
+  await page.getByRole('tab', { name: /^Spends/ }).click();
+  await expectCategoryBudget(page, 'Food & coffee', '1200');
+  await selectMonth(current);
+  await expect(page.locator('.balance-card .stat-value')).toHaveText('₹3,500');
+  await page.getByRole('tab', { name: /^Saves/ }).click();
+  await expect(page.getByTestId('savings-balance')).toHaveText('₹2,000');
+  await expect(page.locator('.savings-ledger-row')).toHaveCount(1);
 });
 
 test('phone layout keeps salary, savings actions, and settings accessible', async ({ page }) => {

@@ -1,4 +1,14 @@
 /* Monthly salary planning and the savings account. Imported after the main theme. */
+.budget-scope-options { border: 0; padding: 0; margin: 0 0 16px; display: grid; gap: 9px; min-width: 0; }
+.budget-scope-options legend { padding: 0; margin-bottom: 10px; color: #756380; font-size: 12px; font-weight: 500; }
+.budget-scope-choice { display: flex; align-items: flex-start; gap: 11px; padding: 13px; border: 1px solid #e9e2f0; border-radius: 8px; background: #fff; cursor: pointer; }
+.budget-scope-choice.selected { background: #f7f3fd; border-color: #cbb9e5; }
+.budget-scope-choice input { flex: 0 0 auto; margin: 3px 0 0; accent-color: #7962d7; width: 15px; height: 15px; }
+.budget-scope-choice strong { display: block; color: #6b527d; font-size: 12px; font-weight: 550; margin-bottom: 5px; }
+.budget-scope-choice small { display: block; color: #95839f; font-size: 11px; line-height: 1.6; }
+.budget-plan-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
+.budget-scope-status { color: #8a7699; font-size: 12px; margin: -7px 0 18px; }
+@media (max-width: 640px) { .budget-plan-actions { width: 100%; } .budget-plan-actions .button { flex: 1; } }
 .money-section-switch { display: inline-flex; gap: 5px; padding: 5px; margin: 0 0 24px; background: #eeebf3; border: 1px solid #e8e2ef; border-radius: 11px; }
 .money-section-switch button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; min-width: 116px; padding: 0 20px; border: 0; border-radius: 7px; color: #82748f; background: transparent; font-size: 13px; font-weight: 500; }
 .money-section-switch button.active, .money-section-switch button[aria-selected='true'] { color: #7156b9; background: #fff; box-shadow: 0 2px 6px #4027690a; }

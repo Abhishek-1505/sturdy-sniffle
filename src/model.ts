@@ -3,7 +3,8 @@ export type Expense = { id: string; title: string; categoryId: string; amount: n
 export type Goal = { id: string; name: string; target: number; saved: number; emoji: string; kind: 'savings' | 'reward' };
 export type MonthlyPlan = { salary: number; fixedCosts: { id: string; name: string; amount: number }[]; savings: number };
 export type SavingsTransaction = { id: string; kind: 'opening' | 'monthly' | 'deposit' | 'withdrawal'; amount: number; date: string; note: string; month?: string; goalId?: string };
-export type MonthRecord = { budgets: Record<string, number>; closed: boolean; rewardTransfer: number; closedAt?: string; plan?: MonthlyPlan; savingsApplied?: boolean };
+export type BudgetScope = 'all' | 'month';
+export type MonthRecord = { budgets: Record<string, number>; closed: boolean; rewardTransfer: number; closedAt?: string; plan?: MonthlyPlan; savingsApplied?: boolean; budgetOverride?: boolean };
 export type State = {
   version: 2;
   currency: string;
@@ -42,7 +43,15 @@ const validDate = (date: string) => {
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
 };
 const editable = (state: State, month: string) => { validateMonth(month); if (state.months[month]?.closed) throw new Error('This month is closed. Its budget and expenses are locked.'); };
-const budgetsFor = (state: State, month: string) => Object.fromEntries(state.categories.map(category => [category.id, state.months[month] ? state.months[month].budgets[category.id] ?? 0 : category.budget]));
+export function categoryBudgets(state: State, month: string): Record<string, number> {
+  validateMonth(month);
+  const record = state.months[month];
+  // Unmarked records are existing month-specific snapshots. Closed records
+  // stay frozen even if they previously followed the recurring amounts.
+  const snapshot = record && (record.closed || record.budgetOverride !== false);
+  return Object.fromEntries(state.categories.map(category => [category.id, snapshot ? record.budgets[category.id] ?? 0 : category.budget]));
+}
+const budgetsFor = categoryBudgets;
 const copyPlan = (plan: MonthlyPlan): MonthlyPlan => ({ ...plan, fixedCosts: plan.fixedCosts.map(cost => ({ ...cost })) });
 const validatePlan = (plan: MonthlyPlan) => {
   money(plan.salary, true); money(plan.savings, true);
@@ -87,7 +96,7 @@ function creditMonth(state: State, month: string, plan: MonthlyPlan): State {
   const record = state.months[month];
   const next: State = {
     ...state,
-    months: { ...state.months, [month]: { ...(record || { budgets: budgetsFor(state, month), closed: false, rewardTransfer: 0 }), plan: copyPlan(plan), savingsApplied: true } },
+    months: { ...state.months, [month]: { ...(record || { budgets: budgetsFor(state, month), closed: false, rewardTransfer: 0, budgetOverride: false }), plan: copyPlan(plan), savingsApplied: true } },
     savingsTransactions: state.savingsTransactions.filter(entry => !(entry.kind === 'monthly' && entry.month === month)),
   };
   if (plan.savings > 0) next.savingsTransactions = [...next.savingsTransactions, { id: `monthly-savings-${month}`, kind: 'monthly', amount: plan.savings, date: `${month}-01`, month, note: 'Automatic monthly savings' }];
@@ -113,7 +122,7 @@ export function setMonthlyPlan(state: State, month: string, plan: MonthlyPlan): 
   editable(state, month); validatePlan(plan);
   if (month < currentMonth()) throw new Error('Change the salary plan for this month or a future month. Past plans stay unchanged.');
   const prepared = applyDueMonths(state); const snapshot = copyPlan(plan);
-  let next: State = { ...prepared, recurringPlan: snapshot, planStartMonth: prepared.planStartMonth && prepared.planStartMonth < month ? prepared.planStartMonth : month, months: { ...prepared.months, [month]: { ...(prepared.months[month] || { budgets: budgetsFor(prepared, month), closed: false, rewardTransfer: 0 }), plan: snapshot } } };
+  let next: State = { ...prepared, recurringPlan: snapshot, planStartMonth: prepared.planStartMonth && prepared.planStartMonth < month ? prepared.planStartMonth : month, months: { ...prepared.months, [month]: { ...(prepared.months[month] || { budgets: budgetsFor(prepared, month), closed: false, rewardTransfer: 0, budgetOverride: false }), plan: snapshot } } };
   const lastAnchor = Object.keys(next.months).filter(key => next.months[key].plan).sort().at(-1)!;
   next.recurringPlan = copyPlan(next.months[lastAnchor].plan!);
   // Replace this month's single credit on edits. Future amounts stay scheduled.
@@ -146,7 +155,7 @@ export function initialState(): State {
       { id: 'getaway', name: 'A little getaway', target: 3000000, saved: 1200000, emoji: '🏝️', kind: 'savings' },
       { id: 'headphones', name: 'Headphones upgrade', target: 800000, saved: 350000, emoji: '🎧', kind: 'reward' },
     ],
-    months: { [month]: { budgets: Object.fromEntries(categories.map(category => [category.id, category.budget])), closed: false, rewardTransfer: 0 } },
+    months: { [month]: { budgets: Object.fromEntries(categories.map(category => [category.id, category.budget])), closed: false, rewardTransfer: 0, budgetOverride: false } },
     rewardPool: 125000, rewardHistory: [], recurringPlan: null, planStartMonth: null,
     savingsTransactions: [{ id: 'demo-opening', kind: 'opening', amount: 4050000, date: `${month}-01`, note: 'Savings brought forward' }],
   };
@@ -155,7 +164,7 @@ export function initialState(): State {
 
 export function emptyState(): State {
   const demo = initialState(); const categories = demo.categories.map(category => ({ ...category, budget: 0 }));
-  return { ...demo, categories, expenses: [], goals: [], rewardPool: 0, rewardHistory: [], recurringPlan: null, planStartMonth: null, savingsTransactions: [], months: { [currentMonth()]: { budgets: Object.fromEntries(categories.map(category => [category.id, 0])), closed: false, rewardTransfer: 0 } } };
+  return { ...demo, categories, expenses: [], goals: [], rewardPool: 0, rewardHistory: [], recurringPlan: null, planStartMonth: null, savingsTransactions: [], months: { [currentMonth()]: { budgets: Object.fromEntries(categories.map(category => [category.id, 0])), closed: false, rewardTransfer: 0, budgetOverride: false } } };
 }
 
 export function monthSummary(state: State, month: string) {
@@ -170,19 +179,35 @@ export function monthSummary(state: State, month: string) {
   return { budget, spent, remaining, availableReward: closed ? 0 : Math.max(0, remaining), closed, transfer: state.months[month]?.rewardTransfer ?? 0, categorySpent, categoryBudgetTotal, salary: plan?.salary ?? 0, fixedCosts, savings: plan?.savings ?? 0 };
 }
 
-export function setBudgets(state: State, month: string, budgets: Record<string, number>): State {
-  editable(state, month); const categories = new Set(state.categories.map(category => category.id));
+export function setBudgets(state: State, month: string, budgets: Record<string, number>, scope: BudgetScope = 'month'): State {
+  editable(state, month);
+  if (scope !== 'all' && scope !== 'month') throw new Error('Choose whether to apply budgets to all months or only this month.');
+  const categories = new Set(state.categories.map(category => category.id));
   for (const [category, amount] of Object.entries(budgets)) { if (!categories.has(category)) throw new Error('Choose a valid budget category.'); money(amount, true); }
-  const updated = { ...budgetsFor(state, month), ...budgets }; totalMoney(Object.values(updated).reduce((sum, amount) => sum + amount, 0));
-  return { ...state, months: { ...state.months, [month]: { ...(state.months[month] || { closed: false, rewardTransfer: 0 }), budgets: updated } } };
+  const updated = { ...budgetsFor(state, month), ...budgets };
+  totalMoney(Object.values(updated).reduce((sum, amount) => sum + amount, 0));
+  const record = { ...(state.months[month] || { closed: false, rewardTransfer: 0 }), budgets: updated, budgetOverride: scope === 'month' };
+  if (scope === 'month') return { ...state, months: { ...state.months, [month]: record } };
+  const months = Object.fromEntries(Object.entries(state.months).map(([key, item]) => [key,
+    !item.closed && item.budgetOverride === false ? { ...item, budgets: { ...updated } } : item,
+  ]));
+  return { ...state, categories: state.categories.map(category => ({ ...category, budget: updated[category.id] })), months: { ...months, [month]: record } };
+}
+
+export function useDefaultBudgets(state: State, month: string): State {
+  editable(state, month);
+  const budgets = Object.fromEntries(state.categories.map(category => [category.id, category.budget]));
+  return { ...state, months: { ...state.months, [month]: { ...(state.months[month] || { closed: false, rewardTransfer: 0 }), budgets, budgetOverride: false } } };
 }
 
 export function addExpense(state: State, expense: Omit<Expense, 'id'>): State {
   money(expense.amount); if (!validDate(expense.date)) throw new Error('Choose a valid expense date.'); editable(state, expense.date.slice(0, 7));
-  if (!expense.title.trim()) throw new Error('Give your expense a name.');
-  if (!state.categories.some(category => category.id === expense.categoryId)) throw new Error('Choose a valid category.');
-  totalMoney(monthSummary(state, expense.date.slice(0, 7)).spent + expense.amount);
-  return { ...state, expenses: [{ ...expense, id: uid(), title: expense.title.trim(), note: expense.note.trim() }, ...state.expenses] };
+  const category = state.categories.find(item => item.id === expense.categoryId);
+  if (!category) throw new Error('Choose a valid category.');
+  const month = expense.date.slice(0, 7);
+  totalMoney(monthSummary(state, month).spent + expense.amount);
+  const months = state.months[month] ? state.months : { ...state.months, [month]: { budgets: categoryBudgets(state, month), closed: false, rewardTransfer: 0, budgetOverride: false } };
+  return { ...state, months, expenses: [{ ...expense, id: uid(), title: expense.title.trim() || category.name, note: expense.note.trim() }, ...state.expenses] };
 }
 
 export function deleteExpense(state: State, id: string): State {
@@ -236,7 +261,7 @@ function validCommon(value: unknown): value is State | LegacyState {
   const categoryIds = new Set(s.categories.map(c => c.id));
   if (categoryIds.size !== s.categories.length || !s.expenses.every(e => e && text(e.id) && text(e.title) && text(e.note) && categoryIds.has(e.categoryId) && cash(e.amount) && e.amount > 0 && text(e.date) && validDate(e.date))) return false;
   if (!s.goals.every(g => g && text(g.id) && text(g.name) && text(g.emoji) && cash(g.target) && g.target > 0 && cash(g.saved) && g.saved <= g.target && (g.kind === 'savings' || g.kind === 'reward'))) return false;
-  if (!Object.entries(s.months).every(([month, record]) => validMonth(month) && record && typeof record.closed === 'boolean' && cash(record.rewardTransfer) && record.budgets && typeof record.budgets === 'object' && !Array.isArray(record.budgets) && Object.entries(record.budgets).every(([id, amount]) => categoryIds.has(id) && cash(amount)) && (record.closedAt === undefined || text(record.closedAt)))) return false;
+  if (!Object.entries(s.months).every(([month, record]) => validMonth(month) && record && typeof record.closed === 'boolean' && cash(record.rewardTransfer) && record.budgets && typeof record.budgets === 'object' && !Array.isArray(record.budgets) && Object.entries(record.budgets).every(([id, amount]) => categoryIds.has(id) && cash(amount)) && (record.closedAt === undefined || text(record.closedAt)) && (record.budgetOverride === undefined || typeof record.budgetOverride === 'boolean'))) return false;
   return s.rewardHistory.every(h => h && text(h.id) && validMonth(h.month) && cash(h.amount) && text(h.date));
 }
 
